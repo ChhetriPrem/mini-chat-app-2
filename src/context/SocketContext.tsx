@@ -1,0 +1,416 @@
+import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
+import { useAuth } from './AuthContext';
+import { ChatMessage, VirtualGift, RoomGuest } from '../types';
+import { sfuManager, PeerMediaStream } from '../lib/sfuManager';
+
+interface SocketContextType {
+  isConnected: boolean;
+  activeRoomId: string | null;
+  joinRoom: (roomId: string) => void;
+  leaveRoom: () => void;
+  sendChatMessage: (content: string) => void;
+  sendVirtualGift: (gift: VirtualGift, count: number) => void;
+  sendEmojiReaction: (emoji: string) => void;
+  takeSeat: (seatNumber: number, slotType?: 'video' | 'audio') => void;
+  leaveSeat: (seatNumber: number) => void;
+  needsMediaPermission: boolean;
+  retryMediaPermission: () => void;
+  toggleMic: (seatNumber: number) => void;
+  toggleVideo: (seatNumber: number) => void;
+  kickGuest: (seatNumber: number) => void;
+  hostToggleMute: (seatNumber: number) => void;
+  promoteGuestToVideo: (seatNumber: number) => void;
+  requestStageSlot: (slotType: 'video' | 'audio') => void;
+  cancelStageRequest: () => void;
+  approveStageRequest: (requestId: string) => void;
+  sendDrawStroke: (stroke: any) => void;
+  clearCanvas: () => void;
+  endStream: () => void;
+  sendDirectMessage: (recipientId: string, encryptedContent: string) => void;
+  markDirectMessagesRead: (senderId: string) => void;
+  incomingDirectMessage: any;
+  readReceiptEvent: { readerId: string; senderId: string } | null;
+  onlineUserIds: Set<string>;
+  isStreamEnded: boolean;
+  streamEndReason: string;
+  chatMessages: ChatMessage[];
+  floatingGifts: { id: string; gift: VirtualGift; count: number; senderName: string }[];
+  floatingEmojis: { id: string; emoji: string }[];
+  systemAnnouncements: string[];
+  currentViewerCount: number;
+  guestSeats: RoomGuest[];
+  stageRequests: any[];
+  remoteMediaStreams: Map<string, PeerMediaStream>;
+  localMediaStream: MediaStream | null;
+}
+
+const SocketContext = createContext<SocketContextType | undefined>(undefined);
+
+export const SocketProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const { user } = useAuth();
+  const socketRef = useRef<WebSocket | null>(null);
+  const activeRoomIdRef = useRef<string | null>(null);
+  const userRef = useRef(user);
+  userRef.current = user;
+
+  const myPublishedSeatRef = useRef<number | null>(null);
+
+  const [isConnected, setIsConnected] = useState(false);
+  const [activeRoomId, setActiveRoomId] = useState<string | null>(null);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [floatingGifts, setFloatingGifts] = useState<{ id: string; gift: VirtualGift; count: number; senderName: string }[]>([]);
+  const [floatingEmojis, setFloatingEmojis] = useState<{ id: string; emoji: string }[]>([]);
+  const [systemAnnouncements, setSystemAnnouncements] = useState<string[]>([]);
+  const [currentViewerCount, setCurrentViewerCount] = useState<number>(109);
+  const [guestSeats, setGuestSeats] = useState<RoomGuest[]>([]);
+  const [stageRequests, setStageRequests] = useState<any[]>([]);
+  const [remoteMediaStreams, setRemoteMediaStreams] = useState<Map<string, PeerMediaStream>>(new Map());
+  const [localMediaStream, setLocalMediaStream] = useState<MediaStream | null>(null);
+  const [isStreamEnded, setIsStreamEnded] = useState(false);
+  const [streamEndReason, setStreamEndReason] = useState('');
+  const [incomingDirectMessage, setIncomingDirectMessage] = useState<any>(null);
+  const [readReceiptEvent, setReadReceiptEvent] = useState<{ readerId: string; senderId: string } | null>(null);
+  const [onlineUserIds, setOnlineUserIds] = useState<Set<string>>(new Set());
+  const [needsMediaPermission, setNeedsMediaPermission] = useState(false);
+
+  // SFU init — only when user is authenticated
+  useEffect(() => {
+    if (!user?.id) return;
+    sfuManager.initSocket((payload) => safeSend(payload), user.id);
+    const unsubscribe = sfuManager.subscribeStreams((map, local) => {
+      setRemoteMediaStreams(map);
+      setLocalMediaStream(local);
+    });
+    return () => { unsubscribe(); };
+  }, [user?.id]);
+
+  // WebSocket connection — only when user is authenticated
+  useEffect(() => {
+    if (!user?.id) return;
+
+    let reconnectTimeout: any = null;
+    let isComponentMounted = true;
+    let retryCount = 0;
+
+    const connectWebSocket = () => {
+      try {
+        const envUrl = (import.meta as any).env?.VITE_WS_URL;
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = envUrl || `${protocol}//${window.location.host}`;
+
+        const ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+          if (!isComponentMounted) return;
+          setIsConnected(true);
+          retryCount = 0;
+
+          ws.send(JSON.stringify({ type: 'identify-user', user: userRef.current }));
+
+          if (activeRoomIdRef.current) {
+            ws.send(JSON.stringify({ type: 'join-room', roomId: activeRoomIdRef.current, user: userRef.current }));
+          }
+        };
+
+        ws.onmessage = (event) => {
+          if (!isComponentMounted) return;
+          try {
+            const data = JSON.parse(event.data);
+            switch (data.type) {
+              case 'direct-message-received':
+                setIncomingDirectMessage(data.message);
+                break;
+              case 'direct-messages-read-ack':
+                setReadReceiptEvent({ readerId: data.readerId, senderId: data.senderId });
+                break;
+              case 'online-status-update':
+                if (Array.isArray(data.onlineUserIds)) setOnlineUserIds(new Set(data.onlineUserIds));
+                break;
+              case 'chat-message':
+                setChatMessages((prev) => {
+                  if (!data.message) return prev;
+                  if (prev.some((m) => m.id === data.message.id)) return prev;
+                  const optIndex = prev.findIndex(
+                    (m) => m.id.startsWith('opt_') && m.sender.id === data.message.sender.id && m.content === data.message.content
+                  );
+                  if (optIndex !== -1) {
+                    const next = [...prev];
+                    next[optIndex] = data.message;
+                    return next;
+                  }
+                  return [...prev.slice(-100), data.message];
+                });
+                break;
+              case 'system-message':
+                setSystemAnnouncements((prev) => [...prev.slice(-10), data.content]);
+                if (data.viewerCount) setCurrentViewerCount(data.viewerCount);
+                break;
+              case 'viewer-count-update':
+                if (data.viewerCount !== undefined) setCurrentViewerCount(data.viewerCount);
+                break;
+              case 'send-gift': {
+                const giftId = `fg_${Date.now()}_${Math.random()}`;
+                setFloatingGifts((prev) => [...prev, { id: giftId, gift: data.gift, count: data.count, senderName: data.sender?.name || 'Anonymous' }]);
+                setTimeout(() => setFloatingGifts((prev) => prev.filter((g) => g.id !== giftId)), 4000);
+                if (data.message) {
+                  setChatMessages((prev) => {
+                    if (prev.some((m) => m.id === data.message.id)) return prev;
+                    const optIndex = prev.findIndex(
+                      (m) => m.id.startsWith('opt_') && m.sender.id === data.message.sender.id && m.content === data.message.content
+                    );
+                    if (optIndex !== -1) { const next = [...prev]; next[optIndex] = data.message; return next; }
+                    return [...prev.slice(-100), data.message];
+                  });
+                }
+                break;
+              }
+              case 'emoji-reaction': {
+                const emojiId = `fe_${Date.now()}_${Math.random()}`;
+                setFloatingEmojis((prev) => [...prev, { id: emojiId, emoji: data.emoji }]);
+                setTimeout(() => setFloatingEmojis((prev) => prev.filter((e) => e.id !== emojiId)), 2500);
+                break;
+              }
+              case 'guests-update': {
+                const guests = data.guests || [];
+                setGuestSeats(guests);
+                if (data.stageRequests) setStageRequests(data.stageRequests);
+                sfuManager.syncStageGuests(guests);
+                const myEntry = guests.find((g: any) => g.user?.id === userRef.current?.id);
+                if (myEntry && myPublishedSeatRef.current !== myEntry.seatNumber) {
+                  myPublishedSeatRef.current = myEntry.seatNumber;
+                  sfuManager.publishSeatMedia(myEntry.seatNumber, myEntry.slotType)
+                    .then(() => setNeedsMediaPermission(sfuManager.hasPendingMediaPermission()))
+                    .catch((err) => {
+                      console.warn('Auto-publish on seat assignment failed:', err);
+                      setNeedsMediaPermission(true);
+                    });
+                } else if (!myEntry) {
+                  myPublishedSeatRef.current = null;
+                }
+                break;
+              }
+              case 'stream-ended':
+                setIsStreamEnded(true);
+                setStreamEndReason(data.reason || 'Live stream has ended.');
+                sfuManager.leaveRoom();
+                break;
+            }
+          } catch (e) {
+            console.error('Error parsing WS message:', e);
+          }
+        };
+
+        ws.onerror = () => {};
+
+        ws.onclose = () => {
+          if (!isComponentMounted) return;
+          setIsConnected(false);
+          if (retryCount < 8) {
+            retryCount++;
+            reconnectTimeout = setTimeout(connectWebSocket, Math.min(15000, 2000 * retryCount));
+          }
+        };
+
+        socketRef.current = ws;
+      } catch (err) {
+        if (isComponentMounted && retryCount < 8) {
+          retryCount++;
+          reconnectTimeout = setTimeout(connectWebSocket, 5000);
+        }
+      }
+    };
+
+    connectWebSocket();
+
+    return () => {
+      isComponentMounted = false;
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      if (socketRef.current) socketRef.current.close();
+    };
+  }, [user?.id]);
+
+  const safeSend = (payload: any) => {
+    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+      try { socketRef.current.send(JSON.stringify(payload)); } catch (err) { console.warn('Socket send suppressed:', err); }
+    }
+  };
+
+  const joinRoom = (roomId: string) => {
+    if (!user) return;
+    setActiveRoomId(roomId);
+    activeRoomIdRef.current = roomId;
+    setChatMessages([]);
+    setGuestSeats([]);
+    setStageRequests([]);
+    setIsStreamEnded(false);
+    setStreamEndReason('');
+    safeSend({ type: 'join-room', roomId, user: userRef.current });
+    sfuManager.joinRoom(roomId, user.name, 'subscriber').catch((err) => console.warn('LiveKit joinRoom failed:', err));
+  };
+
+  const leaveRoom = () => {
+    if (activeRoomId) safeSend({ type: 'leave-room', roomId: activeRoomId });
+    sfuManager.leaveRoom();
+    myPublishedSeatRef.current = null;
+    setActiveRoomId(null);
+    activeRoomIdRef.current = null;
+  };
+
+  const sendChatMessage = (content: string) => {
+    if (!activeRoomIdRef.current || !user) return;
+    const optimisticMsg: ChatMessage = {
+      id: `opt_msg_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      roomId: activeRoomId,
+      sender: user,
+      content,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    };
+    setChatMessages((prev) => [...prev.slice(-100), optimisticMsg]);
+    safeSend({ type: 'chat-message', content, sender: user });
+  };
+
+  const sendVirtualGift = (gift: VirtualGift, count: number) => {
+    if (!activeRoomIdRef.current || !user) return;
+    const giftId = `fg_opt_${Date.now()}_${Math.random()}`;
+    setFloatingGifts((prev) => [...prev, { id: giftId, gift, count, senderName: user.name }]);
+    setTimeout(() => setFloatingGifts((prev) => prev.filter((g) => g.id !== giftId)), 4000);
+    const giftMsg: ChatMessage = {
+      id: `opt_gift_${Date.now()}`,
+      roomId: activeRoomId,
+      sender: user,
+      content: `sent ${gift.name} x${count} ${gift.icon}`,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      isGift: true,
+      giftData: { giftId: gift.id, giftName: gift.name, giftIcon: gift.icon, count, valueCoins: gift.priceCoins },
+    };
+    setChatMessages((prev) => [...prev.slice(-100), giftMsg]);
+    safeSend({ type: 'send-gift', gift, count, sender: user });
+  };
+
+  const sendEmojiReaction = (emoji: string) => {
+    if (!activeRoomIdRef.current) return;
+    safeSend({ type: 'emoji-reaction', emoji });
+  };
+
+  const takeSeat = async (seatNumber: number, slotType: 'video' | 'audio' = 'video') => {
+    if (!activeRoomIdRef.current || !user) return;
+    safeSend({ type: 'seat-action', action: 'take', seatNumber, slotType, user });
+    await sfuManager.publishSeatMedia(seatNumber, slotType);
+    setNeedsMediaPermission(sfuManager.hasPendingMediaPermission());
+  };
+
+  const leaveSeat = (seatNumber: number) => {
+    if (!activeRoomIdRef.current) return;
+    safeSend({ type: 'seat-action', action: 'leave', seatNumber });
+    sfuManager.unpublishSeatMedia();
+    myPublishedSeatRef.current = null;
+    setNeedsMediaPermission(false);
+  };
+
+  // Meant to be called directly from a click handler — see the comment on
+  // sfuManager.retryPublishMedia for why that matters.
+  const retryMediaPermission = async () => {
+    await sfuManager.retryPublishMedia();
+    setNeedsMediaPermission(sfuManager.hasPendingMediaPermission());
+  };
+
+  const toggleMic = (seatNumber: number) => {
+    if (!activeRoomIdRef.current || !user) return;
+    const currentGuest = guestSeats.find((g) => g.seatNumber === seatNumber && g.user.id === user.id);
+    sfuManager.setMicEnabled(currentGuest ? !currentGuest.isMicOn : false);
+    safeSend({ type: 'seat-action', action: 'toggle-mic', seatNumber });
+  };
+
+  const toggleVideo = (seatNumber: number) => {
+    if (!activeRoomIdRef.current || !user) return;
+    const currentGuest = guestSeats.find((g) => g.seatNumber === seatNumber && g.user.id === user.id);
+    sfuManager.setVideoEnabled(currentGuest ? !currentGuest.isVideoOn : false);
+    safeSend({ type: 'seat-action', action: 'toggle-video', seatNumber });
+  };
+
+  const kickGuest = (seatNumber: number) => {
+    if (!activeRoomIdRef.current || !user) return;
+    const guestToKick = guestSeats.find((g) => g.seatNumber === seatNumber);
+    if (guestToKick?.user.id === user.id) {
+      sfuManager.unpublishSeatMedia();
+      myPublishedSeatRef.current = null;
+    }
+    safeSend({ type: 'seat-action', action: 'kick', seatNumber });
+  };
+
+  const hostToggleMute = (seatNumber: number) => {
+    if (!activeRoomIdRef.current || !user) return;
+    const targetGuest = guestSeats.find((g) => g.seatNumber === seatNumber);
+    if (targetGuest?.user.id === user.id) sfuManager.setMicEnabled(!targetGuest.isMutedByHost);
+    safeSend({ type: 'seat-action', action: 'host-toggle-mute', seatNumber });
+  };
+
+  const promoteGuestToVideo = (seatNumber: number) => {
+    if (!activeRoomIdRef.current) return;
+    safeSend({ type: 'seat-action', action: 'promote-to-video', seatNumber });
+  };
+
+  const requestStageSlot = (slotType: 'video' | 'audio') => {
+    if (!activeRoomIdRef.current || !user) return;
+    safeSend({ type: 'seat-action', action: 'request-stage', slotType, user });
+  };
+
+  const cancelStageRequest = () => {
+    if (!activeRoomIdRef.current || !user) return;
+    safeSend({ type: 'seat-action', action: 'cancel-request', user });
+  };
+
+  const approveStageRequest = (requestId: string) => {
+    if (!activeRoomIdRef.current) return;
+    safeSend({ type: 'seat-action', action: 'approve-request', requestId });
+  };
+
+  const sendDrawStroke = (stroke: any) => {
+    if (!activeRoomIdRef.current) return;
+    safeSend({ type: 'draw-stroke', stroke });
+  };
+
+  const clearCanvas = () => {
+    if (!activeRoomIdRef.current) return;
+    safeSend({ type: 'clear-canvas' });
+  };
+
+  const endStream = () => {
+    if (!activeRoomIdRef.current) return;
+    safeSend({ type: 'end-stream' });
+    setIsStreamEnded(true);
+    setStreamEndReason('Host ended the live stream.');
+  };
+
+  const sendDirectMessage = (recipientId: string, encryptedContent: string) => {
+    safeSend({ type: 'direct-message', recipientId, encryptedContent });
+  };
+
+  const markDirectMessagesRead = (senderId: string) => {
+    safeSend({ type: 'mark-messages-read', senderId });
+  };
+
+  const contextValue = React.useMemo(() => ({
+    isConnected, activeRoomId, joinRoom, leaveRoom, sendChatMessage, sendVirtualGift,
+    sendEmojiReaction, takeSeat, leaveSeat, toggleMic, toggleVideo, kickGuest,
+    hostToggleMute, promoteGuestToVideo, requestStageSlot, cancelStageRequest,
+    approveStageRequest, sendDrawStroke, clearCanvas, endStream, sendDirectMessage,
+    markDirectMessagesRead, incomingDirectMessage, readReceiptEvent, onlineUserIds,
+    isStreamEnded, streamEndReason, chatMessages, floatingGifts, floatingEmojis,
+    systemAnnouncements, currentViewerCount, guestSeats, stageRequests,
+    remoteMediaStreams, localMediaStream, needsMediaPermission, retryMediaPermission,
+  }), [
+    isConnected, activeRoomId, incomingDirectMessage, readReceiptEvent, onlineUserIds,
+    isStreamEnded, streamEndReason, chatMessages, floatingGifts, floatingEmojis,
+    systemAnnouncements, currentViewerCount, guestSeats, stageRequests,
+    remoteMediaStreams, localMediaStream, needsMediaPermission,
+  ]);
+
+  return <SocketContext.Provider value={contextValue}>{children}</SocketContext.Provider>;
+};
+
+export const useSocket = () => {
+  const context = useContext(SocketContext);
+  if (!context) throw new Error('useSocket must be used within a SocketProvider');
+  return context;
+};
